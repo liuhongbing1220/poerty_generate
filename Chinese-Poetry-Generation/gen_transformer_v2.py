@@ -2,15 +2,20 @@
 # -*- coding:utf-8 -*-
 
 from char2vec import Char2Vec
-from char_dict import CharDict, pad_of_sentence, start_of_sentence
+from char_dict import CharDict, pad_of_sentence, start_of_sentence,end_of_sentence
 from data_utils import get_batch_data
 from paths import save_dir_transfomer_v2
+from pron_dict import PronDict
 from singleton import Singleton
+from random import random
 import os
 import sys
 import tensorflow as tf
 from modules import positional_encoding, multihead_attention, ff,label_smoothing,noam_scheme,embedding
 from hparams import Hparams
+import numpy as np
+import heapq
+
 import logging
 
 
@@ -27,9 +32,17 @@ hp = parser.parse_args()
 
 class Gen_transformer_v2(Singleton):
     
-    def __init__(self):
+    def __init__(self,training=True):
         print('init_model_....')
-        self.context, self.sentences, self.labels, self.num_batch = get_batch_data()
+
+        if training:
+            self.context, self.sentences, self.labels, self.num_batch = get_batch_data()
+        else:
+            self.contexts = tf.placeholder(
+                shape = [None, hp.maxlen_encoder],dtype = tf.int32, name = "context")
+            self.sentences = tf.placeholder(
+                shape = [None, hp.maxlen_decoder],dtype = tf.int32, name="sentences")
+
         self.char_dict = CharDict()
         self.char2vec = Char2Vec()
         self._build_graph()
@@ -112,7 +125,7 @@ class Gen_transformer_v2(Singleton):
     def _build_optimizer(self):
         """ Define cross-entropy loss and minimize it. """
 
-        self.logits = tf.layers.dense(self.dec, len(self.char_dict))
+        self.logits = tf.layers.dense(self.dec, len(self.char_dict)) ##[None, hp.maxlen_decode, d_model]
         print('self.logits:',self.logits)
         y_smoothing = label_smoothing(tf.one_hot(self.labels, depth = len(self.char_dict)))
         print('y_smoothing:',y_smoothing)
@@ -128,8 +141,8 @@ class Gen_transformer_v2(Singleton):
 #        self.learning_rate = tf.clip_by_value( tf.multiply(1.6e-5, tf.pow(2.1, self.loss)),
 #                clip_value_min = 0.0002,
 #                clip_value_max = 0.02)
-        
         self.opt_step = tf.train.AdamOptimizer(learning_rate = self.learning_rate).minimize(loss = self.loss)
+
 
     def _build_graph(self):
         self._build_encoder()
@@ -148,17 +161,144 @@ class Gen_transformer_v2(Singleton):
             self.trained = True
 
 
-    def _gen_prob_list(self, probs, context, pron_dict):
-        prob_list = probs.tolist()[0]
-        prob_list[0] = 0
-        prob_list[-1] = 0
+    def generate(self, keywords):
+        assert hp.NUM_OF_SENTENCES == len(keywords)
+        pron_dict = PronDict()
+        char_dict = CharDict()
+        context = start_of_sentence()
+        with tf.Session() as session:
+            self._initialize_session(session)
+            if not self.trained:
+                print("Please train the model first! (./train.py -g)")
+                sys.exit(1)
+            for keyword in keywords:
+                ## input context
+                char = start_of_sentence()
+                context_index = [char_dict.charToint(ch, 0) for ch in keyword]
+                context_index2 = [char_dict.charToint(ch, 0) for ch in  context]   
+                context_index.extend(context_index2)
+                context_index = context+[0]*(hp.maxlen_encoder - len(context_index))
+
+                context_index = np.reshape(context_index, (1, hp.maxlen_encoder))
+                ## target context
+                sentence = start_of_sentence
+
+                for ind in range(7):
+                    sentence_index = [char_dict.charToint(ch, 0) for ch in  sentence]
+                    sentence_index = sentence_index + [0]*(hp.maxlen_decoder-len(sentence_index))
+                    sentence_index = np.reshape(sentence_index,(1, hp.maxlen_decoder))
+
+                    encoder_feed_dict = {
+                            self.contexts : context_index,
+                            self.sentences : sentence_index
+                            }
+
+                    probs = session.run(self.probs, feed_dict = encoder_feed_dict)
+                    prob_list = self._gen_prob_list(probs, ind,context, pron_dict)
+
+                    prob_sums = np.cumsum(prob_list)
+                    rand_val = prob_sums[-1] * random()
+                    for i, prob_sum in enumerate(prob_sums):
+                        if rand_val < prob_sum:
+                            char = self.char_dict.int2char(i)
+                            break
+                    context += char
+                    sentence += char 
+                context += end_of_sentence()
+        return context[1:].split(end_of_sentence())
+
+
+    def generate_beam_search(self, keywords, topk):
+        assert hp.NUM_OF_SENTENCES == len(keywords)
+        char_dict = CharDict()
+        context = start_of_sentence()
+        with tf.Session() as session:
+            self._initialize_session(session)
+            if not self.trained:
+                print("Please train the model first! (./train.py -g)")
+                sys.exit(1)
+            for keyword in keywords:
+                ## input context
+                context_index = [char_dict.charToint(ch, 0) for ch in keyword]
+                context_index2 = [char_dict.charToint(ch, 0) for ch in  context]   
+                context_index.extend(context_index2)
+                context_index = context+[0]*(hp.maxlen_encoder - len(context_index))
+                context_index = np.reshape(context_index, (1, hp.maxlen_encoder))
+                
+                ## target context
+                sentence = start_of_sentence
+
+                ind = 0
+                sentence_index = [char_dict.charToint(ch, 0) for ch in  sentence]
+                sentence_index = sentence_index + [0]*(hp.maxlen_decoder-len(sentence_index))
+                sentence_index = np.reshape(sentence_index,(1, hp.maxlen_decoder))
+                char_topk, char_prob_topk = self._gen_char_list(session, ind,context_index, sentence_index, topk)
+                sentences_topk = [sentence+ch for ch in char_topk]
+                while True:
+
+                    char_prob_list=[]
+                    sentences_pred_list = []
+                    ind += 1
+                    for i in range(topk):
+                        sentence_index = [char_dict.charToint(ch, 0) for ch in  sentences_topk[i]]
+                        sentence_index = sentence_index + [0]*(hp.maxlen_decoder-len(sentence_index))
+                        sentence_index = np.reshape(sentence_index,(1, hp.maxlen_decoder))
+
+                        char_topk_tmp, char_prob_topk_tmp = self._gen_char_list(session, ind, context, context_index, sentence_index, topk)
+                        char_prob_topk_tmp = char_prob_topk_tmp * char_prob_topk[i]
+                        char_prob_list.extend(char_prob_topk_tmp)
+                        sentences_pred_tmp = [sentences_topk[i]+ch for ch in char_topk_tmp]
+                        sentences_pred_list.extend(sentences_pred_tmp)
+
+                    char_prob_topk.clear()
+                    sentences_topk.clear()
+                    char_prob_topk, sentences_topk = self._get_topk_prob(char_prob_list, sentences_pred_list,topk)
+                    char_prob_list.clear()
+                    sentences_pred_list.clear()
+
+                    if ind >= 7:
+                        index_max = char_prob_topk.index(max(char_prob_topk))
+                        context = sentences_topk[index_max]
+                        context += end_of_sentence
+                        break
+        return context[1:].split(end_of_sentence())
+
+
+    def _get_topk_prob(self,char_prob_list, sentences_pred_list,topk):
+
+        char_topk_index = map(char_prob_list.index, heapq.nlargest(topk, char_prob_list))
+        char_prob_topk = heapq.nlargest(topk,char_prob_list)
+        sentences_pred_topk = [sentences_pred_list[i] for i in char_topk_index]
+        return char_prob_topk, sentences_pred_topk
+    
+    def _gen_char_list(self, session, ind, context, context_index, sentence_index,topk):
+        pron_dict = PronDict()
+        encoder_feed_dict = {
+                self.contexts : context_index,
+                self.sentences : sentence_index,
+                }
+
+        probs = session.run(self.probs,feed_dict = encoder_feed_dict)
+        prob_list = self._gen_prob_list(probs, ind, context, pron_dict)
+        
+        char_topk=[self.char_dict.int2char(ch) for ch in 
+                                       map(prob_list.index, heapq.nlargest(topk,prob_list))]
+        char_prob_topk = heapq.nlargest(topk,prob_list)
+
+        return char_topk, char_prob_topk
+
+    def _gen_prob_list(self, probs, ind, context, pron_dict):
+        prob_list = probs.tolist()[0][ind]
+        prob_list[0] = 0. ## 0 ---> pad
+        prob_list[1] = 0  ## 1 ---> ^
+        prob_list[-1] = 0 ## -1 ---> $
         idx = len(context)
         used_chars = set(ch for ch in context)
-        for i in range(1, len(prob_list) - 1):
+        for i in range(2, len(prob_list) - 1):
             ch = self.char_dict.int2char(i)
             # Penalize used characters.
             if ch in used_chars:
-                prob_list[i] *= 0.6
+                prob_list[i] *= 0.4
             # Penalize rhyming violations.
             if (idx == 15 or idx == 31) and \
                     not pron_dict.co_rhyme(ch, context[7]):
@@ -171,6 +311,7 @@ class Gen_transformer_v2(Singleton):
                     not pron_dict.counter_tone(context[idx - 2], ch):
                 prob_list[i] *= 0.4
         return prob_list
+
 
     def train(self, n_epochs = 6):
         print("Training transformer-based generator ...")

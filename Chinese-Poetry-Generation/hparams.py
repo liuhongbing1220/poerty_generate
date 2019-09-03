@@ -4,7 +4,7 @@ class Hparams:
     parser = argparse.ArgumentParser()
 
     # prepro
-    parser.add_argument('--vocab_size', default=32000, type=int)
+    parser.add_argument('--vocab_size', default=6000, type=int)
 
     # training scheme
     parser.add_argument('--_BATCH_SIZE', default=64, type=int)
@@ -17,6 +17,8 @@ class Hparams:
                         help="hidden dimension of encoder/decoder")
     parser.add_argument('--CHAR_VEC_DIM', default=512, type=int,
                         help="char embedding")
+    parser.add_argument('--NUM_OF_SENTENCES', default=4, type=int,
+                        help="poetry sentence num")
 
     parser.add_argument('--maxlen_encoder', default=27, type=int,
                         help="maximum length of a encoder sequence")
